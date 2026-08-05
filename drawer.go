@@ -178,7 +178,7 @@ func typedDep[T resource.Resource](deps resource.Dependencies, name resource.Nam
 
 // DoCommand is the module's whole API. Supported commands:
 //
-//	{"command": "draw", "path": "<path to a .tsp file>"}  -> starts a draw, returns immediately
+//	{"command": "draw", "path": "<.tsp points>", "tour": "<tour file>"}  -> starts a draw
 //	{"command": "status"}                                 -> progress of the current/last draw
 //	{"command": "stop"}                                   -> cancels the draw and lifts the pen
 func (d *drawer) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
@@ -221,9 +221,9 @@ func (d *drawer) doDraw(cmd map[string]interface{}) (map[string]interface{}, err
 
 	// Fit the tour into the drawing area (input units -> reference-frame mm), then
 	// simplify in mm so rdp_epsilon is a physical tolerance on the paper.
-	world := fitToArea(ordered, d.cfg)
+	penPath := fitToArea(ordered, d.cfg)
 	if d.cfg.RDPEpsilon > 0 {
-		world = rdp(world, d.cfg.RDPEpsilon)
+		penPath = rdp(penPath, d.cfg.RDPEpsilon)
 	}
 
 	d.mu.Lock()
@@ -233,18 +233,18 @@ func (d *drawer) doDraw(cmd map[string]interface{}) (map[string]interface{}, err
 	}
 	// The draw outlives this RPC, so base its context on Background, not the request.
 	ctx, cancel := context.WithCancel(context.Background())
-	d.running, d.cancel, d.total, d.done, d.lastErr = true, cancel, len(world), 0, nil
+	d.running, d.cancel, d.total, d.done, d.lastErr = true, cancel, len(penPath), 0, nil
 	d.wg.Add(1)
 	d.mu.Unlock()
 
-	go d.runDraw(ctx, world)
+	go d.runDraw(ctx, penPath)
 
-	return map[string]interface{}{"started": true, "points": len(world)}, nil
+	return map[string]interface{}{"started": true, "points": len(penPath)}, nil
 }
 
 // runDraw traces the tour in the background: travel to start, pen down, draw, pen up.
 // On any early exit (error or a "stop"/Close cancellation) it lifts the pen best-effort.
-func (d *drawer) runDraw(ctx context.Context, world [][2]float64) {
+func (d *drawer) runDraw(ctx context.Context, penPath [][2]float64) {
 	defer d.wg.Done()
 
 	cfg, ms := d.cfg, d.motion
@@ -275,7 +275,7 @@ func (d *drawer) runDraw(ctx context.Context, world [][2]float64) {
 	}
 
 	err := func() error {
-		first, last := world[0], world[len(world)-1]
+		first, last := penPath[0], penPath[len(penPath)-1]
 		if err := moveTo(first[0], first[1], cfg.ZLiftMM, travelC); err != nil {
 			return errors.Wrap(err, "moving to start")
 		}
@@ -283,9 +283,9 @@ func (d *drawer) runDraw(ctx context.Context, world [][2]float64) {
 		if err := moveTo(first[0], first[1], cfg.ZDrawMM, drawC); err != nil {
 			return errors.Wrap(err, "lowering pen")
 		}
-		for i := 1; i < len(world); i++ {
-			if err := moveTo(world[i][0], world[i][1], cfg.ZDrawMM, drawC); err != nil {
-				return errors.Wrapf(err, "drawing segment %d/%d", i, len(world)-1)
+		for i := 1; i < len(penPath); i++ {
+			if err := moveTo(penPath[i][0], penPath[i][1], cfg.ZDrawMM, drawC); err != nil {
+				return errors.Wrapf(err, "drawing segment %d/%d", i, len(penPath)-1)
 			}
 			d.setDone(i + 1)
 		}
@@ -317,7 +317,7 @@ func (d *drawer) runDraw(ctx context.Context, world [][2]float64) {
 	if err != nil {
 		d.logger.Warnw("draw ended early", "error", err)
 	} else {
-		d.logger.Infof("draw complete: %d points", len(world))
+		d.logger.Infof("draw complete: %d points", len(penPath))
 	}
 }
 

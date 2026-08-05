@@ -1,7 +1,7 @@
 # tsp-drawer
 
-A Viam **generic service** (`viam:tsp-drawer:pen-plotter`) that reads a
-TSP-art tour from disk (a single TSPLIB `.tsp` file whose points are in draw order)
+A Viam **generic service** (`viam:tsp-drawer:pen-plotter`) that reads a TSP-art tour
+from disk (a TSPLIB `.tsp` of points plus a tour file giving their visiting order)
 and draws it with a pen by issuing **motion-service** plan requests to a
 configured **pen-tip frame**.
 
@@ -82,31 +82,34 @@ All measured on the paper with a ruler — no need to know the tour's coordinate
 
 ## Draw a tour
 
-Give the path to a `.tsp` file. The draw runs in the background and the command
-returns immediately; poll `status` for progress. No coordinate data is passed in
-the command.
+Give the path to a `.tsp` (points) and a `tour` file (the visiting order). The draw
+runs in the background and the command returns immediately; poll `status` for
+progress. No coordinate data is passed in the command.
 
 ```json
-{ "command": "draw", "path": "/data/mona-lisa.tsp" }
+{ "command": "draw", "path": "/data/pikachu.tsp", "tour": "/data/pikachu.tsp.lk-tour" }
 ```
 
-Returns `{ "started": true, "points": N }` (N = points after simplification). A
-second `draw` while one is running is rejected — send `stop` first.
+Both `path` and `tour` are required. Returns `{ "started": true, "points": N }` (N =
+points after simplification). A second `draw` while one is running is rejected — send
+`stop` first.
 
-### Tour contract
+### File contract
 
-The `.tsp` is a TSPLIB file. Its `NODE_COORD_SECTION` (`id x y` rows) is read **in
-file order**, and that order is the draw order — so the producer writes the `.tsp`
-with its rows already ordered by the solved tour. The `id` column is ignored. No
-separate order/tour file is used.
+- **`path`** — a TSPLIB `.tsp`. Points come from its `NODE_COORD_SECTION` (`id x y`
+  rows), keyed by the **1-based** node `id`.
+- **`tour`** — an LKH-style tour: an optional `N M` header line, then `u v weight`
+  edge lines describing the cycle over **0-based** node indices. The module walks the
+  successor edges into a visiting order and closes the loop. Each 0-based tour index
+  `v` resolves to node id `v + 1`.
 
 ```
-NODE_COORD_SECTION
-1 961 10768      <- drawn first
-2 14991 8390     <- drawn second
-3 13616 12541    <- drawn third
-...
-EOF
+# points.tsp                 # points.tsp.lk-tour
+NODE_COORD_SECTION           1480 1480
+1 459602 8116744             0 1 187001     <- node 0 (id 1) -> node 1 (id 2)
+2 627097 8033589             1 4 151174     <- then node 1 -> node 4
+...                          ...
+EOF                          5 0 223596     <- closes back to the start
 ```
 
 ## Status
