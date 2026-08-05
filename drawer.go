@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
@@ -32,19 +33,16 @@ type Config struct {
 	// ReferenceFrame is the frame the goal poses are expressed in. Defaults to "world".
 	ReferenceFrame string `json:"reference_frame"`
 
-	// InputPath is the default file or directory to read a tour from when a "draw"
-	// command doesn't specify its own path. Optional.
-	InputPath string `json:"input_path"`
+	// Drawing area on the paper, in the reference frame (mm; reference_frame, default
+	// "world"). (area_x_mm, area_y_mm) is the min-x/min-y corner; the area extends in
+	// +x/+y over area_width_mm x area_height_mm. The tour's bounding box is uniformly
+	// scaled to fit inside (aspect ratio preserved) and centered, so it may letterbox.
+	AreaXMM      float64 `json:"area_x_mm"`
+	AreaYMM      float64 `json:"area_y_mm"`
+	AreaWidthMM  float64 `json:"area_width_mm"`
+	AreaHeightMM float64 `json:"area_height_mm"`
 
-	// Affine map from input (x,y) units to robot base-frame millimeters on the paper:
-	//   robotX = origin_x_mm + x*mm_per_unit_x
-	//   robotY = origin_y_mm + y*mm_per_unit_y   (NEGATIVE mm_per_unit_y flips the image upright)
-	OriginXMM  float64 `json:"origin_x_mm"`
-	OriginYMM  float64 `json:"origin_y_mm"`
-	MMPerUnitX float64 `json:"mm_per_unit_x"`
-	MMPerUnitY float64 `json:"mm_per_unit_y"` // default: mm_per_unit_x
-
-	// Pen Z heights in robot base-frame millimeters.
+	// Pen Z heights in the reference frame (mm).
 	ZDrawMM float64 `json:"z_draw_mm"` // pen tip touching the paper
 	ZLiftMM float64 `json:"z_lift_mm"` // travel/idle height (pen up)
 
@@ -59,9 +57,9 @@ type Config struct {
 	LineToleranceMM          float64 `json:"line_tolerance_mm"`          // default 1.0
 	OrientationToleranceDegs float64 `json:"orientation_tolerance_degs"` // default 5.0
 
-	// RDPEpsilon downsamples each tour with Ramer–Douglas–Peucker before drawing.
-	// Epsilon is in INPUT units; 0 disables. Collapses near-collinear runs so a dense
-	// tour becomes far fewer motion calls with no visible change to the drawing.
+	// RDPEpsilon downsamples the tour with Ramer–Douglas–Peucker AFTER fitting it to
+	// the drawing area, so epsilon is a deviation tolerance in MILLIMETERS on the paper.
+	// 0 disables. Collapses near-collinear runs into far fewer motion plan requests.
 	RDPEpsilon float64 `json:"rdp_epsilon"`
 }
 
@@ -73,8 +71,8 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.MoveComponent == "" {
 		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "move_component")
 	}
-	if cfg.MMPerUnitX == 0 {
-		return nil, nil, resource.NewConfigValidationError(path, errors.New("mm_per_unit_x must be non-zero"))
+	if cfg.AreaWidthMM <= 0 || cfg.AreaHeightMM <= 0 {
+		return nil, nil, resource.NewConfigValidationError(path, errors.New("area_width_mm and area_height_mm must be positive"))
 	}
 	motionName := cfg.MotionService
 	if motionName == "" {
@@ -90,9 +88,6 @@ func (cfg Config) normalized() Config {
 	}
 	if cfg.ReferenceFrame == "" {
 		cfg.ReferenceFrame = referenceframe.World
-	}
-	if cfg.MMPerUnitY == 0 {
-		cfg.MMPerUnitY = cfg.MMPerUnitX
 	}
 	if cfg.PenOX == 0 && cfg.PenOY == 0 && cfg.PenOZ == 0 {
 		cfg.PenOZ = -1 // straight down
@@ -110,56 +105,60 @@ type drawer struct {
 	resource.Named
 	logger logging.Logger
 
-	mu     sync.Mutex
+	// Set once at construction. The module rebuilds the resource (re-runs the
+	// constructor) on any config change, so these are immutable and need no lock.
 	cfg    Config
 	arm    arm.Arm
 	motion motion.Service
 
-	// cancel interrupts an in-progress draw when a "stop" command arrives.
-	cancel context.CancelFunc
+	// Background-draw state, guarded by mu. A draw runs in its own goroutine so
+	// DoCommand("draw") returns immediately.
+	mu      sync.Mutex
+	running bool
+	cancel  context.CancelFunc // cancels the in-flight draw
+	total   int                // points in the current/last draw
+	done    int                // points reached so far
+	lastErr error              // error from the last finished draw, if any
+	wg      sync.WaitGroup     // tracks the draw goroutine
 }
 
 func newDrawer(
-	ctx context.Context,
+	_ context.Context,
 	deps resource.Dependencies,
 	conf resource.Config,
 	logger logging.Logger,
 ) (resource.Resource, error) {
-	d := &drawer{Named: conf.ResourceName().AsNamed(), logger: logger}
-	if err := d.Reconfigure(ctx, deps, conf); err != nil {
-		return nil, err
-	}
-	return d, nil
-}
-
-func (d *drawer) Reconfigure(_ context.Context, deps resource.Dependencies, conf resource.Config) error {
 	cfg, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	norm := cfg.normalized()
 
 	a, err := typedDep[arm.Arm](deps, arm.Named(norm.Arm))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	m, err := typedDep[motion.Service](deps, motion.Named(norm.MotionService))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.cfg, d.arm, d.motion = norm, a, m
-	return nil
+	return &drawer{
+		Named:  conf.ResourceName().AsNamed(),
+		logger: logger,
+		cfg:    norm,
+		arm:    a,
+		motion: m,
+	}, nil
 }
 
 func (d *drawer) Close(context.Context) error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.cancel != nil {
 		d.cancel()
 	}
+	d.mu.Unlock()
+	d.wg.Wait() // let the draw goroutine unwind (and lift the pen) before returning
 	return nil
 }
 
@@ -179,17 +178,20 @@ func typedDep[T resource.Resource](deps resource.Dependencies, name resource.Nam
 
 // DoCommand is the module's whole API. Supported commands:
 //
-//	{"command": "draw", "points": [[x,y],...], "order": [i,...], ...overrides}
-//	{"command": "stop"}
+//	{"command": "draw", "path": "<path to a .tsp file>"}  -> starts a draw, returns immediately
+//	{"command": "status"}                                 -> progress of the current/last draw
+//	{"command": "stop"}                                   -> cancels the draw and lifts the pen
 func (d *drawer) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	name, _ := cmd["command"].(string)
 	switch name {
 	case "draw":
-		return d.doDraw(ctx, cmd)
+		return d.doDraw(cmd)
+	case "status":
+		return d.doStatus()
 	case "stop":
 		return d.doStop(ctx)
 	case "":
-		return nil, errors.New("missing 'command' (expected \"draw\" or \"stop\")")
+		return nil, errors.New("missing 'command' (expected \"draw\", \"status\", or \"stop\")")
 	default:
 		return nil, errors.Errorf("unknown command %q", name)
 	}
@@ -197,42 +199,55 @@ func (d *drawer) DoCommand(ctx context.Context, cmd map[string]interface{}) (map
 
 func (d *drawer) doStop(ctx context.Context) (map[string]interface{}, error) {
 	d.mu.Lock()
-	cancel, a := d.cancel, d.arm
+	cancel := d.cancel
 	d.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	if err := a.Stop(ctx, nil); err != nil {
+	if err := d.arm.Stop(ctx, nil); err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{"stopped": true}, nil
 }
 
-func (d *drawer) doDraw(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	d.mu.Lock()
-	cfg, ms := d.cfg, d.motion
-	d.mu.Unlock()
-
-	// Resolve the ordered list of points for this tour from the input file(s).
+func (d *drawer) doDraw(cmd map[string]interface{}) (map[string]interface{}, error) {
 	ordered, err := d.loadInput(cmd)
 	if err != nil {
 		return nil, err
-	}
-	if cfg.RDPEpsilon > 0 {
-		ordered = rdp(ordered, cfg.RDPEpsilon)
 	}
 	if len(ordered) == 0 {
 		return nil, errors.New("no points to draw")
 	}
 
-	// Map input units -> robot base-frame millimeters (pen-tip XY on the paper).
-	world := make([][2]float64, len(ordered))
-	for i, p := range ordered {
-		world[i] = [2]float64{
-			cfg.OriginXMM + p[0]*cfg.MMPerUnitX,
-			cfg.OriginYMM + p[1]*cfg.MMPerUnitY,
-		}
+	// Fit the tour into the drawing area (input units -> reference-frame mm), then
+	// simplify in mm so rdp_epsilon is a physical tolerance on the paper.
+	world := fitToArea(ordered, d.cfg)
+	if d.cfg.RDPEpsilon > 0 {
+		world = rdp(world, d.cfg.RDPEpsilon)
 	}
+
+	d.mu.Lock()
+	if d.running {
+		d.mu.Unlock()
+		return nil, errors.New(`a draw is already in progress; send "stop" first`)
+	}
+	// The draw outlives this RPC, so base its context on Background, not the request.
+	ctx, cancel := context.WithCancel(context.Background())
+	d.running, d.cancel, d.total, d.done, d.lastErr = true, cancel, len(world), 0, nil
+	d.wg.Add(1)
+	d.mu.Unlock()
+
+	go d.runDraw(ctx, world)
+
+	return map[string]interface{}{"started": true, "points": len(world)}, nil
+}
+
+// runDraw traces the tour in the background: travel to start, pen down, draw, pen up.
+// On any early exit (error or a "stop"/Close cancellation) it lifts the pen best-effort.
+func (d *drawer) runDraw(ctx context.Context, world [][2]float64) {
+	defer d.wg.Done()
+
+	cfg, ms := d.cfg, d.motion
 
 	// Constraints: keep the pen pointing down, and force straight-line Cartesian
 	// motion while the pen is on the paper so segments don't bow off it.
@@ -242,49 +257,91 @@ func (d *drawer) doDraw(ctx context.Context, cmd map[string]interface{}) (map[st
 		nil, orient, nil)
 	travelC := motionplan.NewConstraints(nil, nil, orient, nil)
 
-	// Make this draw cancellable by a concurrent "stop".
-	ctx, cancel := context.WithCancel(ctx)
-	d.mu.Lock()
-	if d.cancel != nil {
-		d.cancel() // supersede any prior draw
-	}
-	d.cancel = cancel
-	d.mu.Unlock()
-	defer cancel()
-
+	var curX, curY float64
+	penDown := false
 	moveTo := func(x, y, z float64, c *motionplan.Constraints) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		_, err := ms.Move(ctx, motion.MoveReq{
+		if _, err := ms.Move(ctx, motion.MoveReq{
 			ComponentName: cfg.MoveComponent,
 			Destination:   d.poseAt(x, y, z),
 			Constraints:   c,
-		})
-		return err
-	}
-
-	// TSP art is one continuous stroke: travel to start, pen down, trace, pen up.
-	first, last := world[0], world[len(world)-1]
-	if err := moveTo(first[0], first[1], cfg.ZLiftMM, travelC); err != nil {
-		return nil, errors.Wrap(err, "moving to start")
-	}
-	if err := moveTo(first[0], first[1], cfg.ZDrawMM, drawC); err != nil {
-		return nil, errors.Wrap(err, "lowering pen")
-	}
-	for i := 1; i < len(world); i++ {
-		if err := moveTo(world[i][0], world[i][1], cfg.ZDrawMM, drawC); err != nil {
-			return nil, errors.Wrapf(err, "drawing segment %d/%d", i, len(world)-1)
+		}); err != nil {
+			return err
 		}
-	}
-	if err := moveTo(last[0], last[1], cfg.ZLiftMM, travelC); err != nil {
-		return nil, errors.Wrap(err, "lifting pen")
+		curX, curY = x, y
+		return nil
 	}
 
-	return map[string]interface{}{"drew_points": len(world)}, nil
+	err := func() error {
+		first, last := world[0], world[len(world)-1]
+		if err := moveTo(first[0], first[1], cfg.ZLiftMM, travelC); err != nil {
+			return errors.Wrap(err, "moving to start")
+		}
+		penDown = true // from here the pen goes down; retract on any failure
+		if err := moveTo(first[0], first[1], cfg.ZDrawMM, drawC); err != nil {
+			return errors.Wrap(err, "lowering pen")
+		}
+		for i := 1; i < len(world); i++ {
+			if err := moveTo(world[i][0], world[i][1], cfg.ZDrawMM, drawC); err != nil {
+				return errors.Wrapf(err, "drawing segment %d/%d", i, len(world)-1)
+			}
+			d.setDone(i + 1)
+		}
+		if err := moveTo(last[0], last[1], cfg.ZLiftMM, travelC); err != nil {
+			return errors.Wrap(err, "lifting pen")
+		}
+		penDown = false
+		return nil
+	}()
+
+	// If we stopped with the pen on the paper, lift it. Uses a fresh, bounded context
+	// because the draw ctx may already be cancelled (which is why we exited).
+	if penDown {
+		rctx, rcancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if _, rerr := ms.Move(rctx, motion.MoveReq{
+			ComponentName: cfg.MoveComponent,
+			Destination:   d.poseAt(curX, curY, cfg.ZLiftMM),
+			Constraints:   travelC,
+		}); rerr != nil {
+			d.logger.Warnw("failed to lift pen after interrupted draw", "error", rerr)
+		}
+		rcancel()
+	}
+
+	d.mu.Lock()
+	d.running, d.cancel, d.lastErr = false, nil, err
+	d.mu.Unlock()
+
+	if err != nil {
+		d.logger.Warnw("draw ended early", "error", err)
+	} else {
+		d.logger.Infof("draw complete: %d points", len(world))
+	}
 }
 
-// poseAt builds a pen-tip goal pose in the world frame with the fixed pen orientation.
+func (d *drawer) setDone(n int) {
+	d.mu.Lock()
+	d.done = n
+	d.mu.Unlock()
+}
+
+func (d *drawer) doStatus() (map[string]interface{}, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	res := map[string]interface{}{
+		"running": d.running,
+		"drawn":   d.done,
+		"total":   d.total,
+	}
+	if d.lastErr != nil {
+		res["error"] = d.lastErr.Error()
+	}
+	return res, nil
+}
+
+// poseAt builds a pen-tip goal pose in the configured reference frame with the fixed pen orientation.
 func (d *drawer) poseAt(x, y, z float64) *referenceframe.PoseInFrame {
 	ov := &spatialmath.OrientationVectorDegrees{
 		Theta: d.cfg.PenTheta, OX: d.cfg.PenOX, OY: d.cfg.PenOY, OZ: d.cfg.PenOZ,
