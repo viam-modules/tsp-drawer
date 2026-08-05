@@ -2,6 +2,43 @@ package main
 
 import "math"
 
+// fitToArea uniformly scales the tour's bounding box to fit within the configured
+// drawing area (aspect ratio preserved), centers it, and returns pen-tip XY in the
+// reference frame (mm). Assumes pts is non-empty.
+func fitToArea(pts [][2]float64, cfg Config) [][2]float64 {
+	minX, minY := math.Inf(1), math.Inf(1)
+	maxX, maxY := math.Inf(-1), math.Inf(-1)
+	for _, p := range pts {
+		minX, maxX = math.Min(minX, p[0]), math.Max(maxX, p[0])
+		minY, maxY = math.Min(minY, p[1]), math.Max(maxY, p[1])
+	}
+	bw, bh := maxX-minX, maxY-minY
+
+	scale := math.Inf(1)
+	if bw > 0 {
+		scale = cfg.AreaWidthMM / bw
+	}
+	if bh > 0 {
+		scale = math.Min(scale, cfg.AreaHeightMM/bh)
+	}
+	if math.IsInf(scale, 1) {
+		scale = 1 // degenerate: all points coincident
+	}
+
+	// Center the scaled drawing within the area.
+	offsetX := cfg.AreaXMM + (cfg.AreaWidthMM-bw*scale)/2
+	offsetY := cfg.AreaYMM + (cfg.AreaHeightMM-bh*scale)/2
+
+	out := make([][2]float64, len(pts))
+	for i, p := range pts {
+		out[i] = [2]float64{
+			offsetX + (p[0]-minX)*scale,
+			offsetY + (p[1]-minY)*scale,
+		}
+	}
+	return out
+}
+
 // rdp is the Ramer–Douglas–Peucker line simplification. It drops points that lie
 // within epsilon of the straight segment between the surviving endpoints, so long
 // near-collinear runs collapse to a single segment. Endpoints are always kept.
@@ -32,12 +69,4 @@ func perpDistance(p, a, b [2]float64) float64 {
 		return math.Hypot(p[0]-a[0], p[1]-a[1])
 	}
 	return math.Abs(dy*p[0]-dx*p[1]+b[0]*a[1]-b[1]*a[0]) / seg
-}
-
-// strOpt reads a non-empty string option from a command map, else returns def.
-func strOpt(cmd map[string]interface{}, key, def string) string {
-	if v, ok := cmd[key].(string); ok && v != "" {
-		return v
-	}
-	return def
 }
