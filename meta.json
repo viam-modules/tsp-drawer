@@ -1,0 +1,21 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "viam:tsp-drawer",
+  "visibility": "public",
+  "url": "https://github.com/viam-modules/tsp-drawer",
+  "description": "Draws a TSP-art tour (TSPLIB points + tour) with a pen via the motion service",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "viam:tsp-drawer:pen-plotter",
+      "markdown_link": "README.md",
+      "short_description": "reads a TSPLIB tour and draws it with a pen-tip frame via motion plan requests"
+    }
+  ],
+  "build": {
+    "build": "make module",
+    "arch": ["linux/amd64", "linux/arm64", "darwin/arm64"],
+    "path": "bin/module.tar.gz"
+  },
+  "entrypoint": "bin/tsp-drawer"
+}
