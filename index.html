@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>My Viam Dashboard</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        padding: 1rem;
+      }
+      #status {
+        font-weight: bold;
+      }
+      #status.connected {
+        color: green;
+      }
+      #status.disconnected {
+        color: red;
+      }
+      #camera {
+        width: 640px;
+        max-width: 100%;
+        background: #222;
+      }
+      .panel {
+        margin: 1rem 0;
+        padding: 1rem;
+        border: 1px solid #ccc;
+      }
+      button {
+        padding: 0.5rem 1rem;
+        font-size: 1rem;
+      }
+      #uploadedImage {
+        display: block;
+        max-width: 640px;
+        width: 100%;
+        margin-top: 0.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>My Viam Dashboard</h1>
+    <p>Status: <span id="status">Connecting...</span></p>
+    <div class="panel">
+      <h2>Upload image</h2>
+      <input type="file" id="imageUpload" accept="image/*" />
+      <img id="uploadedImage" alt="Uploaded preview" hidden />
+    </div>
+    <div class="panel">
+      <h2>Camera</h2>
+      <video id="camera" autoplay playsinline muted></video>
+    </div>
+
+    <div class="panel">
+      <h2>Sensor readings</h2>
+      <pre id="sensor">—</pre>
+    </div>
+
+    <div class="panel">
+      <h2>Motor</h2>
+      <button id="start">Start motor</button>
+      <button id="stop">Stop motor</button>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
