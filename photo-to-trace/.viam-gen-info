@@ -1,0 +1,13 @@
+{
+  "module_name": "photo-to-trace",
+  "visibility": "private",
+  "namespace": "6d6c7293bc6743e49c8b31c76aac27d3",
+  "language": "go",
+  "resource_type": "service",
+  "resource_subtype": "generic",
+  "model_name": "outliner",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-08-26T18:23:55.510073Z",
+  "module_readme_link": "README.md"
+}
