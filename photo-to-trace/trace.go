@@ -5,7 +5,10 @@ package photototrace
 import (
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
 	_ "image/jpeg"
+	"image/png"
 	_ "image/png"
 	"io"
 	"math"
@@ -254,4 +257,74 @@ func WriteTraceFile(path string, res *TraceResult) error {
 		return err
 	}
 	return f.Close()
+}
+
+// ---------------------------------------------------------------- image rendering
+
+// RenderTraceImage draws the contours as white lines on a black background.
+func RenderTraceImage(res *TraceResult) image.Image {
+	img := image.NewRGBA(image.Rect(0, 0, res.Width, res.Height))
+	draw.Draw(img, img.Bounds(), image.NewUniform(color.Black), image.Point{}, draw.Src)
+
+	white := color.RGBA{255, 255, 255, 255}
+	for _, contour := range res.Contours {
+		for i := 0; i < len(contour)-1; i++ {
+			drawLine(img, contour[i], contour[i+1], white)
+		}
+		if len(contour) > 0 {
+			drawLine(img, contour[len(contour)-1], contour[0], white)
+		}
+	}
+	return img
+}
+
+// drawLine draws a white line between two points using Bresenham's algorithm.
+func drawLine(img *image.RGBA, p1, p2 image.Point, col color.Color) {
+	x0, y0 := p1.X, p1.Y
+	x1, y1 := p2.X, p2.Y
+
+	dx := abs(x1 - x0)
+	dy := abs(y1 - y0)
+	sx := 1
+	sy := 1
+	if x0 > x1 {
+		sx = -1
+	}
+	if y0 > y1 {
+		sy = -1
+	}
+
+	err := dx - dy
+	for {
+		img.Set(x0, y0, col)
+		if x0 == x1 && y0 == y1 {
+			break
+		}
+		e2 := 2 * err
+		if e2 > -dy {
+			err -= dy
+			x0 += sx
+		}
+		if e2 < dx {
+			err += dx
+			y0 += sy
+		}
+	}
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// RenderTraceFile renders contours to a PNG image, creating or truncating it.
+func RenderTraceFile(path string, res *TraceResult) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return png.Encode(f, RenderTraceImage(res))
 }
