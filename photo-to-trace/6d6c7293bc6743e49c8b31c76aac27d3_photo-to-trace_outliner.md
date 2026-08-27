@@ -1,17 +1,81 @@
 # Model 6d6c7293bc6743e49c8b31c76aac27d3:photo-to-trace:outliner
 
-Traces an image of colored shapes on a white background and writes the outline
-points to a CSV, in the order they should be drawn.
+Captures photos from a camera, and traces an image of colored shapes on a white
+background into a CSV of outline points, in the order they should be drawn.
 
 ## Configuration
 
-This model takes no configuration attributes.
-
 ```json
-{}
+{
+  "camera": "realsense",
+  "move_component": "pen-tip-frame",
+  "capture_x_mm": 799.94,
+  "capture_y_mm": -119.62,
+  "capture_z_mm": 349.7,
+  "capture_ox": 1,
+  "capture_oy": 0,
+  "capture_oz": 0,
+  "capture_theta_deg": -0.05
+}
 ```
 
+### Attributes
+
+| Name                | Type   | Inclusion | Description                                                                          |
+|---------------------|--------|-----------|--------------------------------------------------------------------------------------|
+| `camera`            | string | Optional  | Name of the camera `capture` grabs frames from. Omit for a trace-only service.        |
+| `move_component`    | string | Optional  | Frame moved to the capture pose. Required if a capture pose is set.                   |
+| `motion_service`    | string | Optional  | Motion service name. Defaults to `builtin`.                                           |
+| `reference_frame`   | string | Optional  | Frame the capture pose is expressed in. Defaults to `world`.                          |
+| `capture_x_mm`      | float  | Optional  | Capture position, mm in the reference frame.                                          |
+| `capture_y_mm`      | float  | Optional  | Capture position, mm.                                                                 |
+| `capture_z_mm`      | float  | Optional  | Capture position, mm.                                                                 |
+| `capture_ox`        | float  | Optional  | Capture orientation vector. Defaults to `(0, 0, -1)`, pointing straight down.          |
+| `capture_oy`        | float  | Optional  | Capture orientation vector.                                                           |
+| `capture_oz`        | float  | Optional  | Capture orientation vector.                                                           |
+| `capture_theta_deg` | float  | Optional  | Capture orientation angle in degrees.                                                 |
+| `capture_settle_ms` | float  | Optional  | Wait after the arm reaches the pose before capturing, in ms. Defaults to 500; 0 skips. |
+
+All three of `capture_x_mm`, `capture_y_mm` and `capture_z_mm` must be set for
+the arm to move. With any of them missing, `capture` grabs a frame from wherever
+the arm already is and no motion service is required.
+
 ## DoCommand
+
+### `capture`
+
+Moves `move_component` to the configured capture pose, waits for the move to
+finish and for the arm to settle (`capture_settle_ms`), then writes one frame
+from the configured camera to `out` as a PNG.
+With no capture pose configured, it captures without moving the arm.
+
+| Name     | Type   | Inclusion | Description                                                                     |
+|----------|--------|-----------|---------------------------------------------------------------------------------|
+| `out`    | string | Required  | Path of the PNG to write. Created or truncated.                                 |
+| `source` | string | Optional  | Which of the camera's streams to capture, e.g. `color`. Defaults to the first.   |
+
+Request:
+
+```json
+{
+  "command": "capture",
+  "out": "/data/photo.png",
+  "source": "color"
+}
+```
+
+Response:
+
+```json
+{
+  "width": 1280,
+  "height": 720,
+  "out": "/data/photo.png"
+}
+```
+
+A camera with more than one stream — a RealSense reports colour and depth —
+returns whichever it lists first unless `source` names the one you want.
 
 ### `trace`
 
