@@ -25,6 +25,55 @@ composite a subject onto a flat background (white/black/grey/transparent) —
 useful for producing a clean input photo before outlining, or as its own
 output.
 
+## Alternative pipeline: sketch.py (XDoG/FDoG + hatching)
+
+`sketch.py` is a second, swappable edge-generation pipeline meant to be A/B
+tested against `outline.py` on the same photos. It produces the same
+`contour,x,y` CSV, so everything downstream (the drawing robot) works with
+either; it can additionally write a layered SVG for plotter tooling.
+
+Instead of Canny it runs:
+
+1. **Bilateral preprocess** (`lineart.preprocess`) — suppresses pores/noise
+   that Canny turns into false edges.
+2. **XDoG or flow-based DoG** (`lineart.xdog` / `lineart.edge_tangent_flow` +
+   `lineart.fdog`) — FDoG (the default) filters along a smoothed tangent
+   field, producing long coherent strokes that read as drawn rather than
+   detected.
+3. **Landmark-guided thresholds** (`lineart.feature_tau_map`) — the YuNet
+   landmarks locally relax the binarization threshold over eyes, brows, nose
+   and mouth so faint-but-important feature edges survive.
+4. **Highlight suppression** (`lineart.suppress_highlights`) — drops lines in
+   the subject's brightest regions (illustrators lift the pen where light
+   hits), sparing the feature zones.
+5. **Luminance-driven hatching** (`hatching.py`) — shading as a separate
+   stroke layer: streamlines traced along the same flow field, spaced
+   inversely to darkness, so value comes from line density and strokes curve
+   with the form. `--cross-hatch` adds a perpendicular pass in the darkest
+   regions.
+6. **Vectorize + merge** — structural edges are skeletonized and traced with
+   the same machinery as `outline.py`; hatching is born vector. Both layers
+   are budgeted, ordered, and written as CSV (and `--svg`, with structural
+   and hatching as separate SVG layers).
+
+```bash
+python3 sketch.py input.jpg output.csv --preview preview.png --svg output.svg
+```
+
+Useful flags (see `--help`): `--engine xdog|fdog`, `--no-hatch`,
+`--no-landmarks`, `--highlight-percentile`, `--tau` / `--feature-tau`,
+`--hatch-spacing` / `--hatch-min` / `--max-hatch-strokes`, `--bold-offset`
+(duplicates important contours sub-mm offset so they plot bolder), and
+`--debug-dir DIR`, which writes every intermediate stage as an image so each
+stage can be judged independently.
+
+The SVG is written with vpype/Inkscape-compatible layers, so plotter-side
+optimization can be chained on afterwards, e.g.:
+
+```bash
+vpype read output.svg linesort linemerge --tolerance 0.3mm write plot.svg
+```
+
 ## Setup
 
 ```bash
