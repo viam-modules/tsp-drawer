@@ -1,6 +1,7 @@
 package photototrace
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -60,6 +61,46 @@ type Config struct {
 	// before grabbing the frame, letting it stop oscillating. Defaults to 500.
 	// Set it to 0 to capture as soon as the move returns.
 	SettleMS *float64 `json:"capture_settle_ms,omitempty"`
+
+	// PythonBin is the interpreter portrait-outliner's dependencies are
+	// installed into, e.g. "/opt/portrait-outliner/venv/bin/python3". Give an
+	// absolute path: the module process does not inherit your shell's PATH, so
+	// a bare "python3" finds the system interpreter, not your venv.
+	PythonBin string `json:"python_bin,omitempty"`
+	// OutlinerScript is the absolute path to portrait-outliner's outline.py.
+	// Set it together with PythonBin to enable "outline" and "portrait".
+	OutlinerScript string `json:"outliner_script,omitempty"`
+
+	// Defaults for outline.py's stroke budget and shaping, each overridable per
+	// call. Leave one unset to keep outline.py's own default.
+	OutlineMaxStrokes *float64 `json:"outline_max_strokes,omitempty"`
+	OutlineMaxPoints  *float64 `json:"outline_max_points,omitempty"`
+	OutlineMinLength  *float64 `json:"outline_min_length,omitempty"`
+	OutlineFaceShare  *float64 `json:"outline_face_share,omitempty"`
+	OutlineSimplify   *float64 `json:"outline_simplify,omitempty"`
+
+	// OutlineTimeoutS bounds one outline run. Defaults to 300 seconds — the
+	// first run of all is the slow one, since rembg downloads its segmentation
+	// model before it can start.
+	OutlineTimeoutS *float64 `json:"outline_timeout_s,omitempty"`
+
+	// Plotter is the name of the pen-plotter generic service that draws a CSV.
+	// Optional: leave it unset for a service that only produces CSVs for
+	// something else to draw.
+	Plotter string `json:"plotter,omitempty"`
+}
+
+// canOutline reports whether the Python outliner was configured.
+func (cfg Config) canOutline() bool {
+	return cfg.PythonBin != "" && cfg.OutlinerScript != ""
+}
+
+// outlineTimeout returns how long a single outline run may take.
+func (cfg Config) outlineTimeout() time.Duration {
+	if cfg.OutlineTimeoutS == nil || *cfg.OutlineTimeoutS <= 0 {
+		return 300 * time.Second
+	}
+	return time.Duration(*cfg.OutlineTimeoutS * float64(time.Second))
 }
 
 // settle returns how long to wait after the move before capturing.
@@ -117,6 +158,17 @@ func (cfg Config) Validate(path string) ([]string, []string, error) {
 		}
 		deps = append(deps, motion.Named(cfg.normalized().MotionService).String())
 	}
+	// The outliner is a subprocess, not a resource, so it adds no dependency —
+	// but half a configuration would fail only once someone ran "outline".
+	if cfg.PythonBin != "" && cfg.OutlinerScript == "" {
+		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "outliner_script")
+	}
+	if cfg.OutlinerScript != "" && cfg.PythonBin == "" {
+		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "python_bin")
+	}
+	if cfg.Plotter != "" {
+		deps = append(deps, generic.Named(cfg.Plotter).String())
+	}
 	return deps, nil, nil // tracing files needs no hardware at all
 }
 
@@ -126,10 +178,11 @@ type photoToTraceOutliner struct {
 
 	name resource.Name
 
-	logger logging.Logger
-	cfg    Config
-	cam    camera.Camera
-	motion motion.Service
+	logger  logging.Logger
+	cfg     Config
+	cam     camera.Camera
+	motion  motion.Service
+	plotter generic.Service
 
 	cancelCtx  context.Context
 	cancelFunc func()
@@ -175,6 +228,15 @@ func NewOutliner(ctx context.Context, deps resource.Dependencies, name resource.
 		s.motion = ms
 	}
 
+	if s.cfg.Plotter != "" {
+		plotter, err := generic.FromProvider(deps, s.cfg.Plotter)
+		if err != nil {
+			cancelFunc()
+			return nil, err
+		}
+		s.plotter = plotter
+	}
+
 	return s, nil
 }
 
@@ -184,10 +246,11 @@ func (s *photoToTraceOutliner) Name() resource.Name {
 
 // DoCommand supports two commands.
 //
-// "capture" grabs a frame from the configured camera and writes it as a PNG:
+// "capture" grabs a frame from the configured camera and writes it as a PNG,
+// optionally to a second path too (e.g. a cloud-sync folder):
 //
-//	{"command": "capture", "out": "/data/photo.png", "source": "color"}
-//	=> {"width": 1280, "height": 720, "out": "/data/photo.png"}
+//	{"command": "capture", "out": "/data/photo.png", "source": "color", "copy_to": "/sync/photo.png"}
+//	=> {"width": 1280, "height": 720, "out": "/data/photo.png", "copy_to": "/sync/photo.png"}
 //
 // "trace" writes the outline points of each shape in an image to a CSV — a
 // "contour,x,y" header followed by one point per line, in draw order:
@@ -195,6 +258,30 @@ func (s *photoToTraceOutliner) Name() resource.Name {
 //	{"command": "trace", "path": "shape.png", "out": "/data/shape.csv",
 //	 "thresh": 40, "min": 8, "simplify": 0}
 //	=> {"width": 640, "height": 480, "contours": 3, "points": 812, "out": "/data/shape.csv"}
+//
+// "outline" turns a portrait photo into pen strokes by running the
+// portrait-outliner Python program, which writes the same CSV shape:
+//
+//	{"command": "outline", "path": "/data/photo.png", "out": "/data/strokes.csv"}
+//	=> {"strokes": 50, "points": 3421, "out": "/data/strokes.csv", "stats": "..."}
+//
+// "portrait" is the whole pipeline in one call: "capture" then "outline".
+//
+//	{"command": "portrait", "photo": "/data/photo.png", "out": "/data/strokes.csv"}
+//	=> {"width": 1280, "height": 720, "photo": "/data/photo.png",
+//	    "strokes": 50, "points": 3421, "out": "/data/strokes.csv", "stats": "..."}
+//
+// "draw" forwards a CSV already on disk to the configured plotter:
+//
+//	{"command": "draw", "path": "/data/shape.csv"}
+//	=> whatever the plotter's own "draw" DoCommand returns
+//
+// "draw_portrait" is the whole pipeline in one call: "portrait" then "draw".
+//
+//	{"command": "draw_portrait", "photo": "/data/photo.png", "out": "/data/strokes.csv"}
+//	=> {"width": 1280, "height": 720, "photo": "/data/photo.png",
+//	    "strokes": 50, "points": 3421, "out": "/data/strokes.csv", "stats": "...",
+//	    "draw": <whatever the plotter's own "draw" DoCommand returns>}
 func (s *photoToTraceOutliner) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	name, _ := cmd["command"].(string)
 	switch name {
@@ -202,12 +289,22 @@ func (s *photoToTraceOutliner) DoCommand(ctx context.Context, cmd map[string]int
 		return s.capture(ctx, cmd)
 	case "trace":
 		return s.trace(cmd)
+	case "outline":
+		return s.outline(ctx, cmd)
+	case "portrait":
+		return s.portrait(ctx, cmd)
+	case "draw":
+		return s.draw(ctx, cmd)
+	case "draw_portrait":
+		return s.drawPortrait(ctx, cmd)
 	default:
-		return nil, fmt.Errorf("unknown command %q, expected \"capture\" or \"trace\"", name)
+		return nil, fmt.Errorf("unknown command %q, expected \"capture\", \"trace\", \"outline\", \"portrait\", \"draw\" or \"draw_portrait\"", name)
 	}
 }
 
-// capture writes one frame from the configured camera to "out" as a PNG.
+// capture writes one frame from the configured camera to "out" as a PNG, and
+// to "copy_to" too if given — e.g. a directory a data manager syncs to the
+// cloud, so the same photo lands there without a separate upload step.
 //
 // A camera with several streams (a RealSense reports colour and depth) returns
 // whichever it lists first unless "source" names the one you want.
@@ -220,6 +317,7 @@ func (s *photoToTraceOutliner) capture(ctx context.Context, cmd map[string]inter
 	if out == "" {
 		return nil, errors.New("capture: \"out\" is required (path of the PNG to write)")
 	}
+	copyTo, _ := cmd["copy_to"].(string)
 
 	if err := s.moveToCapturePose(ctx); err != nil {
 		return nil, err
@@ -235,25 +333,37 @@ func (s *photoToTraceOutliner) capture(ctx context.Context, cmd map[string]inter
 		return nil, err
 	}
 
-	f, err := os.Create(out)
-	if err != nil {
-		return nil, err
-	}
-	if err := png.Encode(f, img); err != nil {
-		f.Close()
-		return nil, err
-	}
-	if err := f.Close(); err != nil {
+	// Encode once, write the identical bytes to both paths.
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
 		return nil, err
 	}
 
+	paths := []string{out}
+	if copyTo != "" {
+		paths = append(paths, copyTo)
+	}
+	for _, p := range paths {
+		if err := os.WriteFile(p, buf.Bytes(), 0o644); err != nil {
+			return nil, fmt.Errorf("writing %s: %w", p, err)
+		}
+	}
+
 	b := img.Bounds()
-	s.logger.Infof("captured %dx%d from %s -> %s", b.Dx(), b.Dy(), s.cfg.Camera, out)
-	return map[string]interface{}{
+	if copyTo != "" {
+		s.logger.Infof("captured %dx%d from %s -> %s, %s", b.Dx(), b.Dy(), s.cfg.Camera, out, copyTo)
+	} else {
+		s.logger.Infof("captured %dx%d from %s -> %s", b.Dx(), b.Dy(), s.cfg.Camera, out)
+	}
+	res := map[string]interface{}{
 		"width":  b.Dx(),
 		"height": b.Dy(),
 		"out":    out,
-	}, nil
+	}
+	if copyTo != "" {
+		res["copy_to"] = copyTo
+	}
+	return res, nil
 }
 
 // moveToCapturePose sends the configured frame to the capture pose and waits
@@ -327,6 +437,44 @@ func (s *photoToTraceOutliner) trace(cmd map[string]interface{}) (map[string]int
 		"points":   points,
 		"out":      out,
 	}, nil
+}
+
+// draw forwards a CSV already on disk to the configured plotter's own "draw"
+// DoCommand and returns whatever it returns.
+func (s *photoToTraceOutliner) draw(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	if s.plotter == nil {
+		return nil, errors.New("draw: this service has no \"plotter\" configured")
+	}
+
+	path, _ := cmd["path"].(string)
+	if path == "" {
+		return nil, errors.New("draw: \"path\" is required (the CSV to draw)")
+	}
+
+	s.logger.Infof("drawing %s -> %s", path, s.cfg.Plotter)
+	return s.plotter.DoCommand(ctx, map[string]interface{}{"command": "draw", "path": path})
+}
+
+// drawPortrait runs "portrait" then hands the CSV it wrote straight to
+// "draw". It takes every argument "portrait" does.
+func (s *photoToTraceOutliner) drawPortrait(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	if s.plotter == nil {
+		return nil, errors.New("draw_portrait: this service has no \"plotter\" configured")
+	}
+
+	res, err := s.portrait(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	out, _ := res["out"].(string)
+	drawRes, err := s.draw(ctx, map[string]interface{}{"path": out})
+	if err != nil {
+		return nil, err
+	}
+
+	res["draw"] = drawRes
+	return res, nil
 }
 
 // floatArg reads a numeric DoCommand argument, falling back to def when absent.
