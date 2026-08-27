@@ -1,12 +1,13 @@
 # tsp-drawer
 
-A Viam **generic service** (`viam:tsp-drawer:pen-plotter`) that reads a TSP-art tour
-from disk (a TSPLIB `.tsp` of points plus a tour file giving their visiting order)
-and draws it with a pen by issuing **motion-service** plan requests to a
-configured **pen-tip frame**.
+A Viam **generic service** (`viam:tsp-drawer:pen-plotter`) that reads a drawing from
+disk (a `contour,x,y` CSV of points in draw order) and draws it with a pen by issuing
+**motion-service** plan requests to a configured **pen-tip frame**.
 
-Because TSP art is a single continuous closed stroke, a draw is: travel to start →
-pen down → trace every point → pen up. No mid-draw pen lifts.
+The CSV groups points into **strokes** by the `contour` column. Each stroke is drawn
+pen-down; the pen lifts and travels between strokes. So a draw is, per stroke: travel
+to its first point (pen up) → pen down → trace the stroke → pen up → on to the next.
+A single-contour file draws as one continuous stroke.
 
 ## Build
 
@@ -58,59 +59,68 @@ the arm) and set `move_component` to its name. Goal poses are then pen-tip poses
 | `motion_service` | Motion service name. | `builtin` |
 | `reference_frame` | Frame the goal poses are expressed in. | `world` |
 | `area_x_mm`, `area_y_mm` | Min-x/min-y corner of the drawing area in the reference frame (mm; `world` by default); the area extends in +x/+y from here. | `0` |
-| `area_width_mm`, `area_height_mm` | Size of the drawing area (mm). The tour is uniformly scaled to fit inside (aspect preserved) and centered. **Both required, positive.** | — |
+| `area_width_mm`, `area_height_mm` | Size of the drawing area (mm). The drawing is uniformly scaled to fit inside (aspect preserved) and centered. **Both required, positive.** | — |
 | `z_draw_mm` | Pen tip touching the paper (Z in the reference frame). | `0` |
 | `z_lift_mm` | Travel/idle height, pen up. | `0` |
 | `pen_ox`, `pen_oy`, `pen_oz`, `pen_theta_deg` | Fixed pen orientation as an orientation vector (degrees). Default points straight down. | `(0,0,-1,0)` |
 | `line_tolerance_mm` | Max deviation from the straight line for pen-down segments. | `1.0` |
 | `orientation_tolerance_degs` | Max pen-orientation deviation during moves. | `5.0` |
-| `rdp_epsilon` | Ramer–Douglas–Peucker simplification tolerance in **mm on the paper**; `0` disables. Drops points whose removal moves the drawn line less than this, cutting motion-plan requests. Recommended for dense tours. | `0` |
+| `rdp_epsilon` | Ramer–Douglas–Peucker simplification tolerance in **mm on the paper**; `0` disables. Drops points whose removal moves the drawn line less than this, cutting motion-plan requests. Recommended for dense drawings. | `0` |
 
 ### Setting the drawing area and Z
 
-All measured on the paper with a ruler — no need to know the tour's coordinate units.
+All measured on the paper with a ruler — no need to know the drawing's coordinate units.
 
 1. Decide the rectangle on the paper where the drawing should go. Jog the pen tip to
    one corner → that XY is `area_x_mm` / `area_y_mm`; its width/height in mm are
-   `area_width_mm` / `area_height_mm`. The tour is scaled to fit inside and centered.
+   `area_width_mm` / `area_height_mm`. The drawing is scaled to fit inside and centered.
 2. Jog the pen tip down until it touches the paper → that Z is `z_draw_mm`.
 3. `z_lift_mm = z_draw_mm + ~15mm`.
 
 > Orientation (mirrored/upside-down) depends on how the paper sits under the arm and
-> how the `.tsp` is written; there's no flip option — orient the paper (or emit the
-> `.tsp` accordingly) so it comes out right.
+> how the CSV is written; there's no flip option — orient the paper (or emit the
+> CSV accordingly) so it comes out right.
 
-## Draw a tour
+## Draw
 
-Give the path to a `.tsp` (points) and a `tour` file (the visiting order). The draw
-runs in the background and the command returns immediately; poll `status` for
-progress. No coordinate data is passed in the command.
+Give the path to a `contour,x,y` CSV. The file specifies both the points and the
+order to draw them, so nothing else is passed. The draw runs in the background and the
+command returns immediately; poll `status` for progress.
 
 ```json
-{ "command": "draw", "path": "/data/pikachu.tsp", "tour": "/data/pikachu.tsp.lk-tour" }
+{ "command": "draw", "path": "/data/spidey_points.csv" }
 ```
 
-Both `path` and `tour` are required. Returns `{ "started": true, "points": N }` (N =
-points after simplification). A second `draw` while one is running is rejected — send
-`stop` first.
+`path` is required. Returns `{ "started": true, "points": N, "strokes": S }` (N =
+points after simplification, S = number of strokes). A second `draw` while one is
+running is rejected — send `stop` first.
 
 ### File contract
 
-- **`path`** — a TSPLIB `.tsp`. Points come from its `NODE_COORD_SECTION` (`id x y`
-  rows), keyed by the **1-based** node `id`.
-- **`tour`** — an LKH-style tour: an optional `N M` header line, then `u v weight`
-  edge lines describing the cycle over **0-based** node indices. The module walks the
-  successor edges into a visiting order and closes the loop. Each 0-based tour index
-  `v` resolves to node id `v + 1`.
+The CSV is a `contour,x,y` header followed by one row per point, **in draw order**:
 
 ```
-# points.tsp                 # points.tsp.lk-tour
-NODE_COORD_SECTION           1480 1480
-1 459602 8116744             0 1 187001     <- node 0 (id 1) -> node 1 (id 2)
-2 627097 8033589             1 4 151174     <- then node 1 -> node 4
-...                          ...
-EOF                          5 0 223596     <- closes back to the start
+contour,x,y
+0,820,240      <- stroke 0 begins; pen goes down here
+0,833,241
+...
+0,819,241      <- stroke 0 ends
+1,412,905      <- contour changed: pen lifted, traveled here, pen back down
+1,418,910
+...
 ```
+
+- **`contour`** — the stroke id. Consecutive rows sharing a value are one pen-down
+  stroke; each change in the value is a pen-up / travel / pen-down. (It need not be a
+  contiguous integer sequence — any change starts a new stroke.)
+- **`x`, `y`** — the point in the input's own units. All strokes are scaled together
+  by one shared transform to fit the drawing area (aspect preserved) and centered, so
+  their relative positions are kept.
+- A header row (or any non-numeric line) is skipped; rows with fewer than 3 fields are
+  ignored.
+
+> The CSV lives on the **robot's** filesystem (the module runs there), so `path` is a
+> path on the machine — copy the file to the robot first.
 
 ## Status
 
@@ -131,7 +141,7 @@ Cancels the in-progress draw, **lifts the pen** to `z_lift_mm`, and calls `arm.S
 
 ## Notes
 
-- **Scale.** The motion planner runs a full plan per point, so a very dense tour is
+- **Scale.** The motion planner runs a full plan per point, so a very dense drawing is
   slow. Set `rdp_epsilon` (mm) to simplify; poll `status` for progress.
 - **Table obstacle.** Add the table as a static geometry in the robot's **frame
   system** — the motion service uses it automatically (no `WorldState` needed). Set

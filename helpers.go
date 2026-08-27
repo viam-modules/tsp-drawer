@@ -2,15 +2,19 @@ package main
 
 import "math"
 
-// fitToArea uniformly scales the tour's bounding box to fit within the configured
-// drawing area (aspect ratio preserved), centers it, and returns pen-tip XY in the
-// reference frame (mm). Assumes pts is non-empty.
-func fitToArea(pts [][2]float64, cfg Config) [][2]float64 {
+// fitStrokesToArea uniformly scales the bounding box over ALL strokes to fit within
+// the configured drawing area (aspect ratio preserved), centers it, and returns the
+// mapped strokes as pen-tip XY in the reference frame (mm). One shared transform is
+// used across every stroke so their relative positions are preserved. Assumes there
+// is at least one point.
+func fitStrokesToArea(strokes []stroke, cfg Config) []stroke {
 	minX, minY := math.Inf(1), math.Inf(1)
 	maxX, maxY := math.Inf(-1), math.Inf(-1)
-	for _, p := range pts {
-		minX, maxX = math.Min(minX, p[0]), math.Max(maxX, p[0])
-		minY, maxY = math.Min(minY, p[1]), math.Max(maxY, p[1])
+	for _, s := range strokes {
+		for _, p := range s {
+			minX, maxX = math.Min(minX, p[0]), math.Max(maxX, p[0])
+			minY, maxY = math.Min(minY, p[1]), math.Max(maxY, p[1])
+		}
 	}
 	bw, bh := maxX-minX, maxY-minY
 
@@ -29,12 +33,16 @@ func fitToArea(pts [][2]float64, cfg Config) [][2]float64 {
 	offsetX := cfg.AreaXMM + (cfg.AreaWidthMM-bw*scale)/2
 	offsetY := cfg.AreaYMM + (cfg.AreaHeightMM-bh*scale)/2
 
-	out := make([][2]float64, len(pts))
-	for i, p := range pts {
-		out[i] = [2]float64{
-			offsetX + (p[0]-minX)*scale,
-			offsetY + (p[1]-minY)*scale,
+	out := make([]stroke, len(strokes))
+	for i, s := range strokes {
+		mapped := make(stroke, len(s))
+		for j, p := range s {
+			mapped[j] = [2]float64{
+				offsetX + (p[0]-minX)*scale,
+				offsetY + (p[1]-minY)*scale,
+			}
 		}
+		out[i] = mapped
 	}
 	return out
 }
