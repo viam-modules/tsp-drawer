@@ -18,3 +18,5 @@ go.work.sum
 
 # editor
 .vscode
+
+*__pycache__/

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "6d6c7293bc6743e49c8b31c76aac27d3:photo-to-trace",
+  "visibility": "private",
+  "url": "",
+  "description": "Modular generic service: outliner",
+  "applications": null,
+  "markdown_link": "README.md",
+  "entrypoint": "bin/photo-to-trace",
+  "first_run": "",
+  "build": {
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "module.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "darwin/arm64"
+    ]
+  }
+}
