@@ -178,9 +178,9 @@ func typedDep[T resource.Resource](deps resource.Dependencies, name resource.Nam
 
 // DoCommand is the module's whole API. Supported commands:
 //
-//	{"command": "draw", "path": "<path to a .tsp file>"}  -> starts a draw, returns immediately
-//	{"command": "status"}                                 -> progress of the current/last draw
-//	{"command": "stop"}                                   -> cancels the draw and lifts the pen
+//	{"command": "draw", "path": "<contour .csv>"}  -> starts a draw
+//	{"command": "status"}                          -> progress of the current/last draw
+//	{"command": "stop"}                            -> cancels the draw and lifts the pen
 func (d *drawer) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	name, _ := cmd["command"].(string)
 	switch name {
@@ -211,20 +211,24 @@ func (d *drawer) doStop(ctx context.Context) (map[string]interface{}, error) {
 }
 
 func (d *drawer) doDraw(cmd map[string]interface{}) (map[string]interface{}, error) {
-	ordered, err := d.loadInput(cmd)
+	strokes, err := d.loadInput(cmd)
 	if err != nil {
 		return nil, err
 	}
-	if len(ordered) == 0 {
+	if countPoints(strokes) == 0 {
 		return nil, errors.New("no points to draw")
 	}
 
-	// Fit the tour into the drawing area (input units -> reference-frame mm), then
-	// simplify in mm so rdp_epsilon is a physical tolerance on the paper.
-	world := fitToArea(ordered, d.cfg)
+	// Fit the drawing into the area (input units -> reference-frame mm) using one
+	// shared transform across all strokes, then simplify each stroke in mm so
+	// rdp_epsilon is a physical tolerance on the paper.
+	penStrokes := fitStrokesToArea(strokes, d.cfg)
 	if d.cfg.RDPEpsilon > 0 {
-		world = rdp(world, d.cfg.RDPEpsilon)
+		for i := range penStrokes {
+			penStrokes[i] = rdp(penStrokes[i], d.cfg.RDPEpsilon)
+		}
 	}
+	total := countPoints(penStrokes)
 
 	d.mu.Lock()
 	if d.running {
@@ -233,29 +237,37 @@ func (d *drawer) doDraw(cmd map[string]interface{}) (map[string]interface{}, err
 	}
 	// The draw outlives this RPC, so base its context on Background, not the request.
 	ctx, cancel := context.WithCancel(context.Background())
-	d.running, d.cancel, d.total, d.done, d.lastErr = true, cancel, len(world), 0, nil
+	d.running, d.cancel, d.total, d.done, d.lastErr = true, cancel, total, 0, nil
 	d.wg.Add(1)
 	d.mu.Unlock()
 
-	go d.runDraw(ctx, world)
+	go d.runDraw(ctx, penStrokes)
 
-	return map[string]interface{}{"started": true, "points": len(world)}, nil
+	return map[string]interface{}{"started": true, "points": total, "strokes": len(penStrokes)}, nil
 }
 
-// runDraw traces the tour in the background: travel to start, pen down, draw, pen up.
+// runDraw traces the strokes in the background. For each stroke: travel to its first
+// point with the pen up, lower the pen, draw through its points, then lift the pen.
+// The pen is up while traveling between strokes, so each contour is a separate mark.
 // On any early exit (error or a "stop"/Close cancellation) it lifts the pen best-effort.
-func (d *drawer) runDraw(ctx context.Context, world [][2]float64) {
+func (d *drawer) runDraw(ctx context.Context, strokes []stroke) {
 	defer d.wg.Done()
 
 	cfg, ms := d.cfg, d.motion
 
-	// Constraints: keep the pen pointing down, and force straight-line Cartesian
-	// motion while the pen is on the paper so segments don't bow off it.
-	orient := []motionplan.OrientationConstraint{{OrientationToleranceDegs: cfg.OrientationToleranceDegs}}
+	// Pen-down segments use a LinearConstraint: it forces straight-line Cartesian
+	// motion AND holds the pen orientation (via its own orientation tolerance) along
+	// the line, so the drawn segment stays flat and on the paper.
+	//
+	// Travel moves between strokes are left unconstrained (nil): the pen is up, so we
+	// only care about reaching the next start pose, not the path taken. A standalone
+	// path-wide OrientationConstraint here pushed the planner onto cbirrt and a very
+	// thin orientation manifold, which timed out (~52s) even for short moves; the goal
+	// pose's own orientation still lands the pen pointing down.
 	drawC := motionplan.NewConstraints(
 		[]motionplan.LinearConstraint{{LineToleranceMm: cfg.LineToleranceMM, OrientationToleranceDegs: cfg.OrientationToleranceDegs}},
-		nil, orient, nil)
-	travelC := motionplan.NewConstraints(nil, nil, orient, nil)
+		nil, nil, nil)
+	var travelC *motionplan.Constraints // nil => default free planning
 
 	var curX, curY float64
 	penDown := false
@@ -275,24 +287,37 @@ func (d *drawer) runDraw(ctx context.Context, world [][2]float64) {
 	}
 
 	err := func() error {
-		first, last := world[0], world[len(world)-1]
-		if err := moveTo(first[0], first[1], cfg.ZLiftMM, travelC); err != nil {
-			return errors.Wrap(err, "moving to start")
-		}
-		penDown = true // from here the pen goes down; retract on any failure
-		if err := moveTo(first[0], first[1], cfg.ZDrawMM, drawC); err != nil {
-			return errors.Wrap(err, "lowering pen")
-		}
-		for i := 1; i < len(world); i++ {
-			if err := moveTo(world[i][0], world[i][1], cfg.ZDrawMM, drawC); err != nil {
-				return errors.Wrapf(err, "drawing segment %d/%d", i, len(world)-1)
+		reached := 0
+		for si, s := range strokes {
+			if len(s) == 0 {
+				continue
 			}
-			d.setDone(i + 1)
+			start := s[0]
+			// Travel to this stroke's start with the pen up, then lower it.
+			if err := moveTo(start[0], start[1], cfg.ZLiftMM, travelC); err != nil {
+				return errors.Wrapf(err, "traveling to stroke %d/%d", si+1, len(strokes))
+			}
+			penDown = true // from here the pen goes down; retract on any failure
+			if err := moveTo(start[0], start[1], cfg.ZDrawMM, drawC); err != nil {
+				return errors.Wrapf(err, "lowering pen for stroke %d/%d", si+1, len(strokes))
+			}
+			reached++
+			d.setDone(reached)
+
+			for i := 1; i < len(s); i++ {
+				if err := moveTo(s[i][0], s[i][1], cfg.ZDrawMM, drawC); err != nil {
+					return errors.Wrapf(err, "drawing stroke %d/%d segment %d/%d", si+1, len(strokes), i, len(s)-1)
+				}
+				reached++
+				d.setDone(reached)
+			}
+
+			// Lift the pen before traveling to the next stroke.
+			if err := moveTo(curX, curY, cfg.ZLiftMM, travelC); err != nil {
+				return errors.Wrapf(err, "lifting pen after stroke %d/%d", si+1, len(strokes))
+			}
+			penDown = false
 		}
-		if err := moveTo(last[0], last[1], cfg.ZLiftMM, travelC); err != nil {
-			return errors.Wrap(err, "lifting pen")
-		}
-		penDown = false
 		return nil
 	}()
 
@@ -317,7 +342,7 @@ func (d *drawer) runDraw(ctx context.Context, world [][2]float64) {
 	if err != nil {
 		d.logger.Warnw("draw ended early", "error", err)
 	} else {
-		d.logger.Infof("draw complete: %d points", len(world))
+		d.logger.Infof("draw complete: %d strokes, %d points", len(strokes), countPoints(strokes))
 	}
 }
 

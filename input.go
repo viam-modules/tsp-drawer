@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"os"
 	"strconv"
 	"strings"
@@ -8,60 +9,92 @@ import (
 	"github.com/pkg/errors"
 )
 
-// loadInput reads the ordered (x,y) tour for a "draw" command.
+// stroke is one continuous pen-down polyline. A drawing is an ordered list of
+// strokes; the pen lifts, travels, and comes back down between consecutive strokes.
+type stroke = [][2]float64
+
+// loadInput reads the ordered strokes for a "draw" command from a contour CSV:
 //
-// The command gives the path to a TSPLIB .tsp file: {"command":"draw","path":...}.
-// Its NODE_COORD_SECTION rows are taken IN FILE ORDER as the draw order. The
-// producer's contract: write the .tsp with rows already ordered by the solved tour.
-func (d *drawer) loadInput(cmd map[string]interface{}) ([][2]float64, error) {
+//	{"command":"draw","path":"<points.csv>"}
+//
+// The CSV is a "contour,x,y" header then one row per point in draw order. The file
+// itself specifies both the points and the order to visit them, so no separate tour
+// is needed. Consecutive rows sharing a contour value form one stroke; each change in
+// the contour column is a pen-up / travel / pen-down.
+func (d *drawer) loadInput(cmd map[string]interface{}) ([]stroke, error) {
 	path, _ := cmd["path"].(string)
 	if path == "" {
-		return nil, errors.New("draw requires a 'path' to a .tsp file")
+		return nil, errors.New("draw requires a 'path' to a contour CSV file")
 	}
 
-	tour, err := loadCoords(path)
+	strokes, err := loadContourCSV(path)
 	if err != nil {
 		return nil, errors.Wrapf(err, "reading %s", path)
 	}
-	if len(tour) == 0 {
-		return nil, errors.Errorf("no NODE_COORD_SECTION points in %s", path)
+	if len(strokes) == 0 {
+		return nil, errors.Errorf("no points in %s", path)
 	}
-	d.logger.Infof("drawing %d points from %s", len(tour), path)
-	return tour, nil
+	d.logger.Infof("drawing %d strokes (%d points) from %s in file order",
+		len(strokes), countPoints(strokes), path)
+	return strokes, nil
 }
 
-// loadCoords reads a TSPLIB NODE_COORD_SECTION ("id x y" rows) and returns the
-// coordinates IN FILE ORDER — that order is the draw order.
-func loadCoords(path string) ([][2]float64, error) {
-	data, err := os.ReadFile(path)
+// loadContourCSV reads the "contour,x,y" format: a header line then one row per point
+// in draw order. Consecutive rows sharing a contour value form one stroke; each change
+// in the contour column is a pen-up / travel / pen-down. Points keep their file order,
+// so the file itself specifies the drawing order.
+func loadContourCSV(path string) ([]stroke, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	fields := strings.Fields(string(data))
-	i := indexOfKeyword(fields, "NODE_COORD_SECTION")
+	defer f.Close()
 
-	var tour [][2]float64
-	for i >= 0 && i+2 < len(fields) {
-		if _, err := strconv.Atoi(fields[i]); err != nil {
-			break // "EOF" marker or next section keyword ends the coordinates
-		}
-		x, errX := strconv.ParseFloat(fields[i+1], 64)
-		y, errY := strconv.ParseFloat(fields[i+2], 64)
-		if errX != nil || errY != nil {
-			break
-		}
-		tour = append(tour, [2]float64{x, y})
-		i += 3
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1 // tolerate ragged rows; we validate the fields we use
+	r.TrimLeadingSpace = true
+
+	records, err := r.ReadAll()
+	if err != nil {
+		return nil, err
 	}
-	return tour, nil
+
+	var (
+		strokes  []stroke
+		cur      stroke
+		prevC    string
+		havePrev bool
+	)
+	for _, rec := range records {
+		if len(rec) < 3 {
+			continue // blank or short line
+		}
+		c := strings.TrimSpace(rec[0])
+		x, errX := strconv.ParseFloat(strings.TrimSpace(rec[1]), 64)
+		y, errY := strconv.ParseFloat(strings.TrimSpace(rec[2]), 64)
+		if errX != nil || errY != nil {
+			continue // header row ("contour,x,y") or any non-numeric line
+		}
+
+		// A change in the contour column starts a new stroke (pen lift between them).
+		if havePrev && c != prevC && len(cur) > 0 {
+			strokes = append(strokes, cur)
+			cur = nil
+		}
+		cur = append(cur, [2]float64{x, y})
+		prevC, havePrev = c, true
+	}
+	if len(cur) > 0 {
+		strokes = append(strokes, cur)
+	}
+	return strokes, nil
 }
 
-// indexOfKeyword returns the index just after the given keyword token, or -1.
-func indexOfKeyword(fields []string, keyword string) int {
-	for idx, f := range fields {
-		if strings.EqualFold(f, keyword) {
-			return idx + 1
-		}
+// countPoints totals the points across all strokes.
+func countPoints(strokes []stroke) int {
+	n := 0
+	for _, s := range strokes {
+		n += len(s)
 	}
-	return -1
+	return n
 }
