@@ -7,10 +7,6 @@
       body {
         font-family: system-ui, sans-serif;
         padding: 1rem;
-        background-color: black;
-      }
-      h1, h2, p, pre {
-        color: white;
       }
       #status {
         font-weight: bold;
@@ -50,6 +46,7 @@
         display: none !important;
       }
     </style>
+    <script type="module" crossorigin src="/assets/index-CyTqosGa.js"></script>
   </head>
   <body>
     <h1>My Viam Dashboard</h1>
@@ -62,22 +59,19 @@
     </div>
 
     <div class="panel">
-      <button id="startdefault">Draw Pikachu</button>
-      <button id="startcustom">Draw uploaded image</button>
+      <button id="start">Start drawing</button>
       <button id="stop">Stop drawing</button>
     </div>
 
-    <!-- TODO: make this able to be toggled
     <div class="panel">
       <h2>Camera</h2>
       <video id="camera" autoplay playsinline muted></video>
-    </div> -->
+    </div>
 
     <div class="panel">
       <h2>Status</h2>
       <pre id="drawstatus">—</pre>
     </div>
 
-    <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

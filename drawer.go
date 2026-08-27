@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"time"
+	"reflect"
 
 	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
@@ -211,7 +212,10 @@ func (d *drawer) doStop(ctx context.Context) (map[string]interface{}, error) {
 }
 
 func (d *drawer) doDraw(cmd map[string]interface{}) (map[string]interface{}, error) {
+	
+	d.logger.Debugf("type of cmd path ", reflect.TypeOf(cmd["path"]))
 	ordered, err := d.loadInput(cmd)
+	
 	if err != nil {
 		return nil, err
 	}
