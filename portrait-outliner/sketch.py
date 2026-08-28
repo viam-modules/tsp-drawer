@@ -35,6 +35,70 @@ import strokes as strokelib
 FACE_THRESHOLD = 2.5  # same meaning as outline.py
 
 
+def join_strokes(strokes, max_gap=4.0, max_turn_deg=60.0):
+    """Greedily merge strokes whose endpoints nearly touch and flow onward.
+
+    Skeleton tracing cuts every junction and every small gap into a separate
+    stroke, so one eyebrow or jaw line arrives as several fragments. Each
+    fragment costs the arm a pen lift, which is what dominates drawing time.
+    Merging end-to-end fragments that continue in roughly the same direction
+    (within max_turn_deg) redraws the same ink with far fewer contours.
+
+    Only open, unprotected strokes are joined; closed loops and the
+    silhouette are left alone.
+    """
+
+    def outgoing(points):
+        """Forward direction at the tail, averaged over a few points."""
+        span = points[-min(4, len(points)):]
+        vec = span[-1] - span[0]
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 1e-6 else None
+
+    def incoming(points):
+        """Forward direction at the head (pointing into the stroke)."""
+        span = points[:min(4, len(points))]
+        vec = span[-1] - span[0]
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 1e-6 else None
+
+    joinable = [s for s in strokes if not s.closed and not s.protected
+                and len(s.points) >= 2]
+    fixed = [s for s in strokes if s.closed or s.protected
+             or len(s.points) < 2]
+    cos_limit = np.cos(np.radians(max_turn_deg))
+
+    chains = [s.points for s in joinable]
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(chains)):
+            if chains[i] is None:
+                continue
+            for j in range(len(chains)):
+                if i == j or chains[j] is None or chains[i] is None:
+                    continue
+                a, b = chains[i], chains[j]
+                # Try appending b after a, either way round; and prepending
+                # b before a is covered when the loop reaches (j, i).
+                for other in (b, b[::-1]):
+                    if float(np.linalg.norm(a[-1] - other[0])) > max_gap:
+                        continue
+                    da, db = outgoing(a), incoming(other)
+                    if da is None or db is None:
+                        continue
+                    if float(np.dot(da, db)) < cos_limit:
+                        continue
+                    chains[i] = np.vstack([a, other])
+                    chains[j] = None
+                    merged = True
+                    break
+
+    joined = [strokelib.Stroke(c, False, False)
+              for c in chains if c is not None]
+    return fixed + joined
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Convert a headshot photo into illustrator-style plotter "
@@ -116,30 +180,41 @@ def parse_args():
     hatch = parser.add_argument_group("hatching")
     hatch.add_argument("--no-hatch", action="store_true",
                        help="Structural lines only, no shading layer")
-    hatch.add_argument("--hatch-min", type=float, default=0.35,
+    hatch.add_argument("--hatch-min", type=float, default=0.45,
                        help="Hatch only where darkness (0 white, 1 black) "
                        "exceeds this")
-    hatch.add_argument("--hatch-spacing", type=float, default=4.0,
+    hatch.add_argument("--hatch-spacing", type=float, default=6.0,
                        help="Stroke spacing in the darkest shadows, px")
-    hatch.add_argument("--hatch-spacing-max", type=float, default=14.0,
+    hatch.add_argument("--hatch-spacing-max", type=float, default=18.0,
                        help="Stroke spacing at the hatch threshold, px")
-    hatch.add_argument("--hatch-max-length", type=float, default=80.0,
-                       help="Cap on a single hatch stroke's length, px")
+    hatch.add_argument("--hatch-max-length", type=float, default=250.0,
+                       help="Cap on a single hatch stroke's length, px. With "
+                       "a tight stroke budget, long strokes are what make "
+                       "shading affordable: same ink, fewer pen lifts")
     hatch.add_argument("--cross-hatch", action="store_true",
                        help="Add a perpendicular second pass in the darkest "
                        "regions (adds plot time)")
-    hatch.add_argument("--max-hatch-strokes", type=int, default=500,
-                       help="Cap on hatch strokes, densest kept first")
+    hatch.add_argument("--max-hatch-strokes", type=int, default=40,
+                       help="Cap on hatch strokes. More are traced, then the "
+                       "best by darkness times length are kept, so the "
+                       "budget goes to long strokes in the deepest shadows")
 
     budget = parser.add_argument_group("drawing budget (structural layer)")
-    budget.add_argument("--max-strokes", type=int, default=250,
-                        help="Cap on structural pen-down strokes")
-    budget.add_argument("--max-points", type=int, default=20000,
+    budget.add_argument("--max-strokes", type=int, default=60,
+                        help="Cap on structural pen-down strokes. Together "
+                        "with --max-hatch-strokes this bounds total arm "
+                        "drawing time; defaults target ~100 strokes overall")
+    budget.add_argument("--max-points", type=int, default=8000,
                         help="Cap on structural points; met by coarsening "
                         "simplification")
-    budget.add_argument("--min-length", type=float, default=10.0,
+    budget.add_argument("--min-length", type=float, default=16.0,
                         help="Discard structural strokes shorter than this "
-                        "off the face")
+                        "off the face. A single-width pen gains little from "
+                        "tiny ticks, and each costs a pen lift")
+    budget.add_argument("--join-gap", type=float, default=4.0,
+                        help="Merge strokes whose endpoints are within this "
+                        "many px and roughly tangent-continuous, so one "
+                        "feature line costs one pen lift; 0 disables")
     budget.add_argument("--face-min-length", type=float, default=4.0,
                         help="Length limit on the face instead of "
                         "--min-length")
@@ -150,10 +225,12 @@ def parse_args():
                         help="Douglas-Peucker tolerance, px")
     budget.add_argument("--smooth", type=int, default=1,
                         help="Chaikin smoothing passes")
-    budget.add_argument("--bold-offset", type=float, default=0.7,
+    budget.add_argument("--bold-offset", type=float, default=0.0,
                         help="Duplicate important contours (silhouette, "
                         "long face lines) offset by this many px so they "
-                        "plot bolder; 0 disables")
+                        "plot bolder. Off by default: with one pen width "
+                        "and a tight stroke budget, doubled lines spend "
+                        "strokes better used on features or shading")
     budget.add_argument("--thickness", type=int, default=2,
                         help="Structural stroke thickness in the preview "
                         "image only")
@@ -372,6 +449,11 @@ def convert(args):
     traced = [strokelib.Stroke(points, False, False)
               for points in strokelib.trace_skeleton(skeleton)]
 
+    # Join fragments before length filtering: several sub-threshold pieces
+    # of one real line add up to a keeper once merged.
+    if args.join_gap > 0:
+        traced = join_strokes(traced, max_gap=args.join_gap)
+
     structural = silhouette + traced
     structural = strokelib.filter_by_length(
         structural, weights, args.min_length, args.face_min_length,
@@ -391,13 +473,31 @@ def convert(args):
     hatch = []
     if not args.no_hatch:
         tx, ty, _ = flow
+        # Trace more than the budget allows, then keep the strokes that buy
+        # the most shading per pen lift: score is arc length times mean
+        # darkness, so a long stroke through a deep shadow beats a short
+        # scratch in a mid-tone. The spacing pattern keeps survivors from
+        # clumping, since neighbours were traced no closer than the local
+        # spacing to begin with.
         polylines = hatching.hatch_strokes(
             gray_pre, tx, ty, mask=interior_mask,
             darkness_min=args.hatch_min, spacing_min=args.hatch_spacing,
             spacing_max=args.hatch_spacing_max,
             max_length=args.hatch_max_length, cross=args.cross_hatch,
-            max_strokes=args.max_hatch_strokes,
+            max_strokes=max(4 * args.max_hatch_strokes, 200),
         )
+        if len(polylines) > args.max_hatch_strokes:
+            darkness = 1.0 - gray_pre.astype(np.float32) / 255.0
+            h, w = darkness.shape
+
+            def score(points):
+                cols = np.clip(np.round(points[:, 0]).astype(int), 0, w - 1)
+                rows = np.clip(np.round(points[:, 1]).astype(int), 0, h - 1)
+                length = strokelib.arc_length(points)
+                return length * float(darkness[rows, cols].mean())
+
+            polylines.sort(key=score, reverse=True)
+            polylines = polylines[:args.max_hatch_strokes]
         hatch = [
             strokelib.Stroke(
                 strokelib.smooth(strokelib.simplify(points, 0.75), 1), False,
