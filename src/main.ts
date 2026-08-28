@@ -150,6 +150,7 @@ async function main() {
 
 setupImageUpload();
 drawDefault("/root/pika/pikachu.tsp");
+drawCustom();
 stop();
 
 main().catch((err) => {
