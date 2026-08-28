@@ -76,6 +76,7 @@ function setupImageUpload() {
     drawPointsPreview(points, showLines);
 
     points_for_drawing = points.x.map((x, i) => [x, points.y[i]]);
+    console.log(points_for_drawing);
 
     // Release the memory once the browser has rendered it
     uploadedImageEl.onload = () => URL.revokeObjectURL(objectUrl);

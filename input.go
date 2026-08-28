@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/csv"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -8,102 +10,182 @@ import (
 	"github.com/pkg/errors"
 )
 
-// loadInput reads the ordered (x,y) tour for a "draw" command, from either
-// {"command":"draw","path":...}       — a TSPLIB .tsp file on the robot, or
-// {"command":"draw","point_array":...} — [[x,y],...] sent straight in the command.
+// stroke is one continuous pen-down polyline. A drawing is an ordered list of
+// strokes; the pen lifts, travels, and comes back down between consecutive strokes.
+type stroke = [][2]float64
+
+// loadInput reads the ordered strokes for a "draw" command from a contour CSV:
 //
-// Either way the points are taken IN THE ORDER GIVEN as the draw order. The
-// producer's contract: order the rows by the solved tour before sending.
-func (d *drawer) loadInput(cmd map[string]interface{}) ([][2]float64, error) {
+//	{"command":"draw","path":"<points.csv>"}
+//
+// The CSV is a "contour,x,y" header then one row per point in draw order. The file
+// itself specifies both the points and the order to visit them, so no separate tour
+// is needed. Consecutive rows sharing a contour value form one stroke; each change in
+// the contour column is a pen-up / travel / pen-down.
+func (d *drawer) loadInput(cmd map[string]interface{}) ([]stroke, error) {
 	path, _ := cmd["path"].(string)
 
 	if raw, ok := cmd["point_array"]; ok && raw != nil {
-		tour, err := parsePointArray(raw)
+		strokes, err := parsePointArray(raw)
 		if err != nil {
 			return nil, err
 		}
-		if len(tour) == 0 {
+		if countPoints(strokes) == 0 {
 			return nil, errors.New("'point_array' is empty")
 		}
-		d.logger.Infof("drawing %d points from point_array", len(tour))
-		return tour, nil
+		d.logger.Infof("drawing %d strokes (%d points) from point_array in the order given",
+			len(strokes), countPoints(strokes))
+		return strokes, nil
 	}
 
 	if path == "" {
-		return nil, errors.New("draw requires a 'path' to a .tsp file or a 'point_array'")
+		return nil, errors.New("draw requires a 'path' to a contour CSV file")
 	}
 
-	tour, err := loadCoords(path)
+	strokes, err := loadContourCSV(path)
 	if err != nil {
 		return nil, errors.Wrapf(err, "reading %s", path)
 	}
-	if len(tour) == 0 {
-		return nil, errors.Errorf("no NODE_COORD_SECTION points in %s", path)
+	if len(strokes) == 0 {
+		return nil, errors.Errorf("no points in %s", path)
 	}
-	d.logger.Infof("drawing %d points from %s", len(tour), path)
-	return tour, nil
+	d.logger.Infof("drawing %d strokes (%d points) from %s in file order",
+		len(strokes), countPoints(strokes), path)
+	return strokes, nil
 }
 
-// parsePointArray decodes a [[x,y],...] value out of a DoCommand payload. The
-// command arrives as a protobuf Struct, so nested arrays land as []interface{}
+// parsePointArray decodes the "point_array" value of a DoCommand payload into
+// strokes. Two shapes are accepted, matching what a caller naturally has to hand:
+//
+//	[[x,y], ...]          -> one continuous stroke
+//	[[[x,y], ...], ...]   -> one entry per stroke, i.e. the CSV's contour grouping
+//
+// The command arrives as a protobuf Struct, so nested arrays land as []interface{}
 // of []interface{} and every number is a float64 — never a Go [][2]float64.
-func parsePointArray(raw interface{}) ([][2]float64, error) {
+func parsePointArray(raw interface{}) ([]stroke, error) {
 	rows, ok := raw.([]interface{})
 	if !ok {
-		return nil, errors.Errorf("'point_array' must be a list of [x,y] pairs, got %T", raw)
+		return nil, errors.Errorf("'point_array' must be a list of [x,y] pairs or a list of strokes, got %T", raw)
+	}
+	if len(rows) == 0 {
+		return nil, nil
 	}
 
-	tour := make([][2]float64, 0, len(rows))
+	// Disambiguate on the first element: a pair of numbers means the flat shape,
+	// anything nested deeper means the grouped shape.
+	if isPointPair(rows[0]) {
+		s, err := parseStroke(rows, "point_array")
+		if err != nil {
+			return nil, err
+		}
+		return []stroke{s}, nil
+	}
+
+	strokes := make([]stroke, 0, len(rows))
+	for i, row := range rows {
+		pts, ok := row.([]interface{})
+		if !ok {
+			return nil, errors.Errorf("point_array[%d] must be a list of [x,y] pairs, got %T", i, row)
+		}
+		s, err := parseStroke(pts, fmt.Sprintf("point_array[%d]", i))
+		if err != nil {
+			return nil, err
+		}
+		if len(s) > 0 { // an empty stroke would be a spurious pen lift
+			strokes = append(strokes, s)
+		}
+	}
+	return strokes, nil
+}
+
+// parseStroke decodes one flat list of [x,y] pairs. label names the list in errors.
+func parseStroke(rows []interface{}, label string) (stroke, error) {
+	s := make(stroke, 0, len(rows))
 	for i, row := range rows {
 		pair, ok := row.([]interface{})
 		if !ok {
-			return nil, errors.Errorf("point_array[%d] must be an [x,y] pair, got %T", i, row)
+			return nil, errors.Errorf("%s[%d] must be an [x,y] pair, got %T", label, i, row)
 		}
 		if len(pair) != 2 {
-			return nil, errors.Errorf("point_array[%d] must have 2 values, got %d", i, len(pair))
+			return nil, errors.Errorf("%s[%d] must have 2 values, got %d", label, i, len(pair))
 		}
 		x, okX := pair[0].(float64)
 		y, okY := pair[1].(float64)
 		if !okX || !okY {
-			return nil, errors.Errorf("point_array[%d] must hold numbers, got [%T %T]", i, pair[0], pair[1])
+			return nil, errors.Errorf("%s[%d] must hold numbers, got [%T %T]", label, i, pair[0], pair[1])
 		}
-		tour = append(tour, [2]float64{x, y})
+		s = append(s, [2]float64{x, y})
 	}
-	return tour, nil
+	return s, nil
 }
 
-// loadCoords reads a TSPLIB NODE_COORD_SECTION ("id x y" rows) and returns the
-// coordinates IN FILE ORDER — that order is the draw order.
-func loadCoords(path string) ([][2]float64, error) {
-	data, err := os.ReadFile(path)
+// isPointPair reports whether v is a 2-element list of numbers, i.e. an [x,y].
+func isPointPair(v interface{}) bool {
+	pair, ok := v.([]interface{})
+	if !ok || len(pair) != 2 {
+		return false
+	}
+	_, okX := pair[0].(float64)
+	_, okY := pair[1].(float64)
+	return okX && okY
+}
+
+// loadContourCSV reads the "contour,x,y" format: a header line then one row per point
+// in draw order. Consecutive rows sharing a contour value form one stroke; each change
+// in the contour column is a pen-up / travel / pen-down. Points keep their file order,
+// so the file itself specifies the drawing order.
+func loadContourCSV(path string) ([]stroke, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	fields := strings.Fields(string(data))
-	i := indexOfKeyword(fields, "NODE_COORD_SECTION")
+	defer f.Close()
 
-	var tour [][2]float64
-	for i >= 0 && i+2 < len(fields) {
-		if _, err := strconv.Atoi(fields[i]); err != nil {
-			break // "EOF" marker or next section keyword ends the coordinates
-		}
-		x, errX := strconv.ParseFloat(fields[i+1], 64)
-		y, errY := strconv.ParseFloat(fields[i+2], 64)
-		if errX != nil || errY != nil {
-			break
-		}
-		tour = append(tour, [2]float64{x, y})
-		i += 3
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1 // tolerate ragged rows; we validate the fields we use
+	r.TrimLeadingSpace = true
+
+	records, err := r.ReadAll()
+	if err != nil {
+		return nil, err
 	}
-	return tour, nil
+
+	var (
+		strokes  []stroke
+		cur      stroke
+		prevC    string
+		havePrev bool
+	)
+	for _, rec := range records {
+		if len(rec) < 3 {
+			continue // blank or short line
+		}
+		c := strings.TrimSpace(rec[0])
+		x, errX := strconv.ParseFloat(strings.TrimSpace(rec[1]), 64)
+		y, errY := strconv.ParseFloat(strings.TrimSpace(rec[2]), 64)
+		if errX != nil || errY != nil {
+			continue // header row ("contour,x,y") or any non-numeric line
+		}
+
+		// A change in the contour column starts a new stroke (pen lift between them).
+		if havePrev && c != prevC && len(cur) > 0 {
+			strokes = append(strokes, cur)
+			cur = nil
+		}
+		cur = append(cur, [2]float64{x, y})
+		prevC, havePrev = c, true
+	}
+	if len(cur) > 0 {
+		strokes = append(strokes, cur)
+	}
+	return strokes, nil
 }
 
-// indexOfKeyword returns the index just after the given keyword token, or -1.
-func indexOfKeyword(fields []string, keyword string) int {
-	for idx, f := range fields {
-		if strings.EqualFold(f, keyword) {
-			return idx + 1
-		}
+// countPoints totals the points across all strokes.
+func countPoints(strokes []stroke) int {
+	n := 0
+	for _, s := range strokes {
+		n += len(s)
 	}
-	return -1
+	return n
 }

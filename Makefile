@@ -1,7 +1,9 @@
 BIN_OUTPUT_PATH = bin
+GOOS ?= linux
+GOARCH ?= amd64
 
 build:
-	go build -o $(BIN_OUTPUT_PATH)/tsp-drawer .
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o $(BIN_OUTPUT_PATH)/tsp-drawer .
 
 module: build
 	rm -f $(BIN_OUTPUT_PATH)/module.tar.gz
