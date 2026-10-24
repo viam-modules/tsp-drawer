@@ -48,7 +48,7 @@ func loadContourCSV(path string) ([]stroke, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	r := csv.NewReader(f)
 	r.FieldsPerRecord = -1 // tolerate ragged rows; we validate the fields we use
